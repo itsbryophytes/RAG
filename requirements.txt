@@ -9,7 +9,6 @@ google-genai
 
 asyncpg==0.29.0
 
-easyocr==1.7.1
 Pillow==9.5.0
 numpy==1.26.4
 

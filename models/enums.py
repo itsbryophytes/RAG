@@ -15,3 +15,8 @@ class ResponseSafety(str, Enum):
     SAFE = "safe"
     EMERGENCY = "emergency"
     UNCERTAIN = "uncertain"
+
+class StagingStatus (str, Enum):
+    PENDING = "pending"
+    CONFIRMED = "confirmed"
+    DISCARDED = "discarded"

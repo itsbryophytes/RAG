@@ -6,6 +6,7 @@ from fastapi.responses import JSONResponse
 
 from config import get_settings
 from stores.pgvector_store import PGVectorStore
+from stores.staging_store import StagingStore
 from routers import chat_router, pipeline_router
 from utils.logger import get_logger
 
@@ -19,6 +20,8 @@ async def lifespan(app: FastAPI):
 
     store = PGVectorStore()
     await store.init_db()
+    staging = StagingStore()
+    await staging.init_db()
     logger.info("Database ready.")
 
     yield
@@ -47,7 +50,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled exception: {exc}", exc_info=True)
@@ -60,7 +62,6 @@ async def global_exception_handler(request: Request, exc: Exception):
 app.include_router(chat_router.router)
 app.include_router(pipeline_router.router)
 
-
 @app.get("/")
 async def root():
     return {
@@ -68,7 +69,6 @@ async def root():
         "version": "1.0.0",
         "docs": "/docs",
     }
-
 
 @app.get("/healthz")
 async def healthz():

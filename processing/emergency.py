@@ -78,6 +78,17 @@ def normalize(text: str) -> str:
 
 def check_emergency(text: str) -> tuple[bool, int, str | None]:
     text = normalize(text)
+    info_keywords = [
+        "apa itu",
+        "what is",
+        "jelaskan",
+        "explain",
+        "gejala",
+        "symptoms",
+        "penyebab",
+    ]
+    if any(k in text for k in info_keywords):
+        return False, None, None
     
     if TIER1_REGEX.search(text):
         logger.warning("TIER-1 emergency detected in user message")

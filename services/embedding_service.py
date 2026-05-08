@@ -41,6 +41,7 @@ class EmbeddingService:
                 contents=text,
                 config=types.EmbedContentConfig(
                     task_type="RETRIEVAL_QUERY",
+                    output_dimensionality=self.dim,
                 ),
             ),
         )
@@ -63,6 +64,7 @@ class EmbeddingService:
                 contents=text,
                 config=types.EmbedContentConfig(
                     task_type="RETRIEVAL_DOCUMENT",
+                    output_dimensionality=self.dim,
                 ),
             ),
         )

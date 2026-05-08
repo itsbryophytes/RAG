@@ -152,6 +152,7 @@ class PGVectorStore:
         query_embedding: list[float],
         top_k: int | None = None,
         threshold: float | None = None,
+        metadata_filter: dict | None = None,
     ) -> list[RetrievedChunk]:
         top_k = top_k or settings.RETRIEVAL_TOP_K
         threshold = (
@@ -162,25 +163,48 @@ class PGVectorStore:
 
         pool = await get_pool()
         async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT
-                    chunk_id,
-                    content,
-                    document_id,
-                    metadata,
-                    1 - (embedding <=> $1::VECTOR) AS score
-                FROM document_chunks
-                WHERE user_id = $2
-                  AND 1 - (embedding <=> $1::VECTOR) >= $3
-                ORDER BY embedding <=> $1::VECTOR
-                LIMIT $4;
-                """,
-                _encode_vector(query_embedding),
-                user_id,
-                threshold,
-                top_k,
-            )
+            if metadata_filter:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        chunk_id,
+                        content,
+                        document_id,
+                        metadata,
+                        1 - (embedding <=> $1::VECTOR) AS score
+                    FROM document_chunks
+                    WHERE user_id = $2
+                      AND 1 - (embedding <=> $1::VECTOR) >= $3
+                      AND metadata @> $5::jsonb
+                    ORDER BY embedding <=> $1::VECTOR
+                    LIMIT $4;
+                    """,
+                    _encode_vector(query_embedding),
+                    user_id,
+                    threshold,
+                    top_k,
+                    json.dumps(metadata_filter),
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        chunk_id,
+                        content,
+                        document_id,
+                        metadata,
+                        1 - (embedding <=> $1::VECTOR) AS score
+                    FROM document_chunks
+                    WHERE user_id = $2
+                      AND 1 - (embedding <=> $1::VECTOR) >= $3
+                    ORDER BY embedding <=> $1::VECTOR
+                    LIMIT $4;
+                    """,
+                    _encode_vector(query_embedding),
+                    user_id,
+                    threshold,
+                    top_k,
+                )
 
         results = [
             RetrievedChunk(
@@ -188,7 +212,7 @@ class PGVectorStore:
                 content=row["content"],
                 score=float(row["score"]),
                 source_document_id=row["document_id"],
-                metadata=row["metadata"] or {},
+                metadata=json.loads(row["metadata"]) if isinstance(row["metadata"], str) else (row["metadata"] or {}),
             )
             for row in rows
         ]

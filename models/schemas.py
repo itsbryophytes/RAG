@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from typing import Any, Optional
+from datetime import datetime
 from pydantic import BaseModel, Field
-from models.enums import DocumentType, ResponseSafety
-
+from models.enums import DocumentType, ResponseSafety, StagingStatus
 
 class ChatMessage(BaseModel):
     role: str = Field(..., pattern="^(user|assistant)$")
@@ -43,17 +43,55 @@ class DocumentUploadResponse(BaseModel):
     message: str = "Document processed successfully."
 
 class LabParameter(BaseModel):
-    value: float
-    unit: str
-    raw_value: str
-    normal_range: Optional[str] = None
-    flag: Optional[str] = None
+    name: str = Field(description="The name of the parameter")
+    value: float | None = None
+    unit: str | None = None
+    raw_value: str | None = None
+    normal_range: str | None = None
+    flag: str | None = None
 
 class StructuredLabResult(BaseModel):
-    parameters: dict[str, LabParameter]
-    raw_text: str
-    confidence: float
-    lab_name: Optional[str] = None
-    patient_name: Optional[str] = None
-    date: Optional[str] = None
-    warnings: list[str] = Field(default_factory=list)
+    parameters: list[LabParameter]
+    raw_text: str | None = None
+    confidence: float | None = None
+    lab_name: str | None = None
+    patient_name: str | None = None
+    date: str | None = None
+    warnings: list[str] = []
+
+class IngestionResponse(BaseModel):
+    document_id: str
+    user_id: str
+    filename: str
+    document_type: DocumentType
+    chunks_indexed: int
+    ocr_confidence: float
+    preview: Optional[dict[str, Any]] = None
+    rag_ready: bool = True
+    message: str = (
+        "Document processed. RAG is ready."
+        "Review the preview and confirm to save your health record."
+    )
+
+class StagingRecord(BaseModel):
+    document_id: str
+    user_id: str
+    filename: str
+    document_type: DocumentType
+    structured_data: Optional[dict[str, Any]]
+    ocr_confidence: float
+    status: StagingStatus
+    created_at: datetime
+    expires_at: datetime
+
+class ConfirmResponse(BaseModel):
+    document_id: str
+    user_id: str
+    saved: bool
+    message: str
+
+class DiscardResponse(BaseModel):
+    document_id: str
+    user_id: str
+    rag_chunks_removed: int
+    message: str

@@ -42,9 +42,24 @@ def chunk_text(
 
     def flush(sentences_in_chunk: list[str]) -> None:
         nonlocal chunk_index, char_cursor
-        content = " ".join(sentences_in_chunk).strip()
-        if not content:
+        
+        context_parts = []
+        if meta.get("patient_name"):
+            context_parts.append(f"Patient: {meta['patient_name']}")
+        if meta.get("document_type"):
+            context_parts.append(f"Type: {meta['document_type']}")
+        if meta.get("lab_name"):
+            context_parts.append(f"Lab: {meta['lab_name']}")
+        if meta.get("date"):
+            context_parts.append(f"Date: {meta['date']}")
+            
+        context_prefix = f"[{' | '.join(context_parts)}]\n" if context_parts else ""
+        
+        raw_content = " ".join(sentences_in_chunk).strip()
+        if not raw_content:
             return
+            
+        content = context_prefix + raw_content
         start = char_cursor
         end = start + len(content)
         chunks.append(
