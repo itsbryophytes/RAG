@@ -78,9 +78,34 @@ async def chat_stream(request: ChatRequest) -> AsyncIterator[str]:
         yield "data: [DONE]\n\n"
         return
 
+    # ── 1. Condense Question (Context Awareness) ───────────
+    # If there is history, we ask Gemini to create a standalone query
+    # that incorporates the previous context for better RAG retrieval.
+    search_query = message
+    if request.history:
+        history_summary = "\n".join([f"{m.role}: {m.content}" for m in request.history])
+        condense_prompt = f"""
+Given the following conversation history and a follow-up question, 
+rephrase the follow-up question to be a standalone question that can be 
+used for a similarity search in a medical database.
+
+History:
+{history_summary}
+
+Follow-up Question: {message}
+
+Standalone Question (return ONLY the question):"""
+        try:
+            search_query = await _gemini_svc.complete(condense_prompt)
+            search_query = search_query.strip().strip('"')
+            logger.info(f"Condensed query: {search_query}")
+        except Exception as exc:
+            logger.warning(f"Condense question failed: {exc}")
+
+    # ── 2. Retrieval ──────────────────────────────────────
     query_embedding = None
     try:
-        query_embedding = await _embedding_svc.embed_query(message)
+        query_embedding = await _embedding_svc.embed_query(search_query)
     except Exception as exc:
         logger.error(f"Embedding failed: {exc}")
         query_embedding = None
@@ -89,11 +114,15 @@ async def chat_stream(request: ChatRequest) -> AsyncIterator[str]:
 
     if query_embedding is not None:
         try:
+            # Lowering default threshold to 0.5 for better recall
+            effective_threshold = request.threshold if request.threshold == 0.65 else request.threshold
+            if effective_threshold == 0.65: effective_threshold = 0.5 
+            
             chunks = await _vector_store.similarity_search(
                 user_id=user_id,
                 query_embedding=query_embedding,
                 top_k=request.top_k,
-                threshold=request.threshold,
+                threshold=effective_threshold,
             )
         except Exception as exc:
             logger.error(f"Vector search failed: {exc}")
@@ -109,24 +138,46 @@ async def chat_stream(request: ChatRequest) -> AsyncIterator[str]:
             ]
         )
     else:
-        context_block = ""
+        context_block = "No specific medical records found for this query."
 
-    messages = [
-        {
-            "role": "system",
-            "content": SYSTEM_PROMPT
-        },
-        {
-            "role": "user",
-            "content": f"""
-    Context:
-    {context_block if context_block else "No medical records available."}
+    # ── 3. Generation ─────────────────────────────────────
+    # Fetch user profile for more context
+    profile_block = ""
+    try:
+        profile = await _vector_store.get_user_profile(user_id)
+        if profile:
+            items = []
+            if profile.get("date_of_birth"):
+                # Simple age calculation if possible
+                dob = profile["date_of_birth"]
+                items.append(f"DOB: {dob}")
+            if profile.get("biological_sex"): items.append(f"Sex: {profile['biological_sex']}")
+            if profile.get("height_cm"): items.append(f"Height: {profile['height_cm']}cm")
+            if profile.get("weight_kg"): items.append(f"Weight: {profile['weight_kg']}kg")
+            if profile.get("blood_type"): items.append(f"Blood: {profile['blood_type']}")
+            if profile.get("existing_conditions"): items.append(f"Conditions: {profile['existing_conditions']}")
+            if profile.get("current_medications"): items.append(f"Medications: {profile['current_medications']}")
+            profile_block = "User Health Profile: " + ", ".join(items)
+    except Exception as exc:
+        logger.warning(f"Failed to fetch user profile for chat: {exc}")
 
-    User question:
-    {message}
-    """
-        }
-    ]
+    messages = []
+    for m in request.history:
+        messages.append({"role": m.role, "content": m.content})
+    
+    messages.append({
+        "role": "user",
+        "content": f"""
+User Profile:
+{profile_block if profile_block else "No profile data available."}
+
+Context from health records:
+{context_block}
+
+User question:
+{message}
+"""
+    })
 
     meta = ChatResponseMeta(
         safety=ResponseSafety.SAFE,

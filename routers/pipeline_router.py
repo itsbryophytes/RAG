@@ -6,7 +6,7 @@ from models.enums import DocumentType
 from pipelines.ingestion_pipeline import ingest
 from services.rag_service import RAGService
 from stores.staging_store import StagingStore
-from stores.pgvector_store import PGVectorStore
+from stores.pgvector_store import PGVectorStore, get_pool
 from utils.logger import get_logger
 
 logger = get_logger(__name__)

@@ -5,7 +5,6 @@ from config import get_settings
 
 settings = get_settings()
 
-
 @dataclass
 class Chunk:
     chunk_id: str

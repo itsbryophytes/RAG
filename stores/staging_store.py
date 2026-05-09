@@ -244,7 +244,7 @@ class StagingStore:
         return [
             {
                 **dict(r),
-                "structured_data": json.loads(r["structured_data"]) if r["structured_data"] else None,
+                "structured_data": self._normalize_structured_data(r["structured_data"]),
             }
             for r in rows
         ]
