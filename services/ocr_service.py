@@ -87,7 +87,7 @@ class OCRService:
         try:
             # Call Gemini asynchronously using the new SDK
             response = await self.client.models.generate_content(
-                model='gemini-2.5-flash',
+                model=settings.GEMINI_CHAT_MODEL,
                 contents=contents,
                 config=types.GenerateContentConfig(
                     temperature=0.0,

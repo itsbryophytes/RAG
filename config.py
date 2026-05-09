@@ -5,8 +5,8 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     GEMINI_API_KEY: str
-    GEMINI_CHAT_MODEL: str = "gemini-2.5-flash"
-    GEMINI_EMBED_MODEL: str = "models/gemini-embedding-2"
+    GEMINI_CHAT_MODEL: str = "gemini-1.5-flash"
+    GEMINI_EMBED_MODEL: str = "models/text-embedding-004"
     GEMINI_EMBED_DIM: int = 768
 
     POSTGRES_HOST: str = "localhost"

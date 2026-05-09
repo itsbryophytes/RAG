@@ -261,3 +261,19 @@ class PGVectorStore:
             )
 
         return [dict(row) for row in rows]
+
+    async def get_user_profile(self, user_id: str) -> dict | None:
+        """Fetch the user's health profile from the shared database."""
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT 
+                    date_of_birth, biological_sex, height_cm, weight_kg, 
+                    blood_type, smoking_status, existing_conditions, current_medications
+                FROM user_health_profiles
+                WHERE user_id = $1::uuid;
+                """,
+                user_id,
+            )
+            return dict(row) if row else None

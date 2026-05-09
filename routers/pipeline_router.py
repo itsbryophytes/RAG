@@ -15,14 +15,16 @@ Old /api/pipeline/upload is now backed by ingestion_pipeline.ingest()
 instead of document_pipeline.ingest_document().
 """
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query
+import json
+import uuid
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query, Body
 
 from models.schemas import IngestionResponse, ConfirmResponse, DiscardResponse
 from models.enums import DocumentType
 from pipelines.ingestion_pipeline import ingest
 from services.rag_service import RAGService
 from stores.staging_store import StagingStore
-from stores.pgvector_store import PGVectorStore
+from stores.pgvector_store import PGVectorStore, get_pool
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -96,14 +98,18 @@ async def list_staging(
 async def confirm_document(
     document_id: str,
     user_id: str = Query(..., min_length=1, max_length=128),
+    updated_data: dict | None = Body(default=None),
 ):
     """
     Confirm a document preview → saves structured data to the permanent
     lab_results table. RAG vectors are already in place from upload.
 
-    This is the user's explicit consent to add this data to their health record.
+    If updated_data is provided (JSON body), it replaces the original OCR extraction.
+    The body should be: { "report_date": "...", "lab_name": "...", "metrics": {...} }
     """
-    saved = await _staging.confirm(document_id=document_id, user_id=user_id)
+    saved = await _staging.confirm(
+        document_id=document_id, user_id=user_id, updated_data=updated_data
+    )
     if not saved:
         raise HTTPException(
             status_code=404,
@@ -168,6 +174,63 @@ async def discard_document(
     )
 
 
+@router.post("/manual")
+async def create_manual_record(body: dict):
+    """
+    Create a manual health record.
+    Saves to lab_results and indexes for RAG.
+    """
+    user_id = body.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+
+    document_id = str(uuid.uuid4())
+    lab_name = body.get("lab_name", "Manual Entry")
+    report_date = body.get("report_date", "")
+    metrics = body.get("metrics", {})
+
+    # Use the same structured_data shape as confirmed OCR documents so the
+    # frontend mapping is identical on every re-fetch:
+    # { report_date, lab_name, metrics: { ... } }
+    structured_data = {
+        "report_date": report_date,
+        "lab_name": lab_name,
+        "metrics": metrics,
+    }
+
+    # 1. Index for RAG
+    summary = f"Manual Lab Result from {lab_name} on {report_date}.\n"
+    for k, v in metrics.items():
+        if v: summary += f"{k}: {v}\n"
+
+    await _rag_svc.index_text(
+        user_id=user_id,
+        document_id=document_id,
+        text=summary,
+        extra_metadata={
+            "source": "manual",
+            "lab_name": lab_name,
+            "report_date": report_date,
+        }
+    )
+
+    # 2. Save to lab_results
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO lab_results
+                (document_id, user_id, filename, document_type,
+                 structured_data, ocr_confidence)
+            VALUES ($1, $2, $3, 'lab_result', $4::JSONB, 1.0);
+            """,
+            document_id, user_id, f"Manual_{report_date}",
+            json.dumps(structured_data)
+        )
+
+    return {"document_id": document_id, "message": "Manual record created."}
+
+
 # ── Dashboard: confirmed results ──────────────────────────────────────────────
 
 @router.get("/results")
@@ -180,6 +243,24 @@ async def get_lab_results(
     """
     results = await _staging.get_lab_results(user_id)
     return {"user_id": user_id, "results": results, "count": len(results)}
+
+
+@router.put("/results/{document_id}")
+async def update_lab_result(
+    document_id: str,
+    user_id: str = Query(..., min_length=1, max_length=128),
+    updated_data: dict = Body(...),
+):
+    """Update an existing confirmed lab result."""
+    updated = await _staging.update_lab_result(
+        document_id=document_id, user_id=user_id, updated_data=updated_data
+    )
+    if not updated:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Lab result not found for document_id={document_id}.",
+        )
+    return {"message": "Lab result updated successfully.", "document_id": document_id}
 
 
 # ── RAG document management ───────────────────────────────────────────────────

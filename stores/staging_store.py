@@ -181,10 +181,10 @@ class StagingStore:
     # ── Confirm ───────────────────────────────────────────────────
 
     @async_retry(max_attempts=3, base_delay=0.5, exceptions=(asyncpg.PostgresError,))
-    async def confirm(self, document_id: str, user_id: str) -> bool:
+    async def confirm(self, document_id: str, user_id: str, updated_data: dict | None = None) -> bool:
         """
         Move structured data from staging → lab_results (permanent).
-        Returns True if a record was found and confirmed, False otherwise.
+        If updated_data is provided, it replaces what was in staging.
         """
         pool = await get_pool()
         async with pool.acquire() as conn:
@@ -208,6 +208,8 @@ class StagingStore:
                 )
                 return False
 
+            final_data = json.dumps(updated_data) if updated_data else row["structured_data"]
+
             async with conn.transaction():
                 # Insert into permanent table
                 await conn.execute(
@@ -222,7 +224,7 @@ class StagingStore:
                     """,
                     row["document_id"], row["user_id"],
                     row["filename"], row["document_type"],
-                    row["structured_data"], row["ocr_confidence"],
+                    final_data, row["ocr_confidence"],
                 )
                 # Mark staging as confirmed (don't delete — useful for audit)
                 await conn.execute(
@@ -286,6 +288,100 @@ class StagingStore:
 
     # ── Query confirmed results ────────────────────────────────────
 
+    @staticmethod
+    def _normalize_structured_data(raw: str | dict | None) -> dict:
+        """
+        Normalize structured_data to a single canonical shape:
+            { report_date, lab_name, metrics: { snake_case_key: value_string } }
+
+        Handles three historical storage formats:
+        1. New format  – { report_date, lab_name, metrics: {...} }
+        2. Manual v1   – { date, lab_name, metrics: {...} }
+        3. Raw OCR     – { date, lab_name, parameters: { "Display Name": { value, unit } } }
+        4. NULL / empty
+        """
+        if not raw:
+            return {"report_date": "", "lab_name": "", "metrics": {}}
+
+        sd: dict = json.loads(raw) if isinstance(raw, str) else raw
+
+        # ── Extract scalar meta fields ──────────────────────────────
+        report_date: str = (
+            sd.get("report_date")
+            or sd.get("date")
+            or ""
+        )
+        lab_name: str = sd.get("lab_name") or sd.get("lab") or ""
+
+        # ── Build canonical metrics dict ────────────────────────────
+        # Prefer already-normalised metrics block (new format / manual)
+        metrics: dict = {}
+
+        if sd.get("metrics"):
+            raw_metrics = sd["metrics"]
+            for k, v in raw_metrics.items():
+                if k == "additional_metrics":
+                    continue
+                if isinstance(v, dict) and "value" in v:
+                    metrics[k] = str(v["value"]) if v["value"] is not None else ""
+                elif v is not None:
+                    metrics[k] = str(v)
+
+            # Preserve additional_metrics sub-dict as-is
+            if "additional_metrics" in raw_metrics:
+                metrics["additional_metrics"] = raw_metrics["additional_metrics"]
+
+        elif sd.get("parameters"):
+            # Raw OCR format: keys are display names like "Glucose Fasting"
+            _DISPLAY_TO_SNAKE: dict[str, str] = {
+                "glucose fasting": "glucose_fasting",
+                "fasting glucose": "glucose_fasting",
+                "gula puasa": "glucose_fasting",
+                "glucose postmeal": "glucose_postmeal",
+                "post-meal glucose": "glucose_postmeal",
+                "post meal glucose": "glucose_postmeal",
+                "hba1c": "hba1c",
+                "hemoglobin a1c": "hba1c",
+                "total cholesterol": "chol_total",
+                "cholesterol total": "chol_total",
+                "ldl": "chol_ldl",
+                "ldl cholesterol": "chol_ldl",
+                "hdl": "chol_hdl",
+                "hdl cholesterol": "chol_hdl",
+                "triglyceride": "triglycerides",
+                "triglycerides": "triglycerides",
+                "hemoglobin": "hemoglobin",
+                "hematocrit": "hematocrit",
+                "white blood": "wbc",
+                "leukosit": "wbc",
+                "wbc": "wbc",
+                "platelet": "platelets",
+                "trombosit": "platelets",
+                "uric acid": "uric_acid",
+                "asam urat": "uric_acid",
+                "creatinine": "creatinine",
+                "kreatinin": "creatinine",
+                "blood urea nitrogen": "bun",
+                "bun": "bun",
+            }
+
+            for display_name, param in sd["parameters"].items():
+                key_lower = display_name.lower()
+                snake = next(
+                    (v for k, v in _DISPLAY_TO_SNAKE.items() if k in key_lower),
+                    None,
+                )
+                if snake is None:
+                    snake = display_name  # keep unknown keys as-is
+                value = param.get("value") if isinstance(param, dict) else param
+                metrics[snake] = str(value) if value is not None else ""
+
+        return {
+            "report_date": report_date,
+            "lab_name": lab_name,
+            "metrics": metrics,
+        }
+
     async def get_lab_results(self, user_id: str) -> list[dict[str, Any]]:
         """Retrieve all confirmed lab results for dashboard."""
         pool = await get_pool()
@@ -303,7 +399,26 @@ class StagingStore:
         return [
             {
                 **dict(r),
-                "structured_data": json.loads(r["structured_data"]) if r["structured_data"] else None,
+                "structured_data": self._normalize_structured_data(r["structured_data"]),
             }
             for r in rows
         ]
+
+    async def update_lab_result(self, document_id: str, user_id: str, updated_data: dict[str, Any]) -> bool:
+        """Update an existing confirmed lab result."""
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE lab_results
+                SET structured_data = $1::JSONB
+                WHERE document_id = $2 AND user_id = $3;
+                """,
+                json.dumps(updated_data),
+                document_id,
+                user_id,
+            )
+        found = int(result.split()[-1]) > 0
+        if found:
+            logger.info(f"Updated: document={document_id} user={user_id}")
+        return found
