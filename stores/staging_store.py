@@ -1,21 +1,3 @@
-"""
-stores/staging_store.py — Staging layer for structured lab data.
-
-WHY THIS EXISTS:
-  After OCR we have two outputs:
-    A) clean text  → goes to pgvector immediately (RAG is ready)
-    B) structured  → stays here until user confirms
-
-  This table is the "draft" state. Nothing in here is part of the
-  user's permanent health record until they explicitly confirm.
-
-TABLES:
-  lab_result_staging  — temporary, expires 24h after upload
-  lab_results         — permanent, written only on confirmation
-
-Both tables live in the same PostgreSQL database as pgvector.
-"""
-
 from __future__ import annotations
 
 import json
@@ -24,24 +6,18 @@ from typing import Any, Optional
 
 import asyncpg
 
-from stores.pgvector_store import get_pool   # reuse the same connection pool
+from stores.pgvector_store import get_pool
 from models.enums import DocumentType, StagingStatus
 from utils.logger import get_logger
 from utils.retry import async_retry
 
 logger = get_logger(__name__)
 
-STAGING_TTL_HOURS = 24   # staging records auto-expire after this
+STAGING_TTL_HOURS = 24
 
 
 class StagingStore:
-    """
-    Manages the staging → confirm/discard lifecycle for structured lab data.
-    Uses the same asyncpg pool as PGVectorStore.
-    """
-
     async def init_db(self) -> None:
-        """Create staging and final tables if they don't exist. Idempotent."""
         pool = await get_pool()
         async with pool.acquire() as conn:
             await conn.execute("""
@@ -80,8 +56,6 @@ class StagingStore:
             """)
             logger.info("Staging schema initialised.")
 
-    # ── Write staging ─────────────────────────────────────────────
-
     @async_retry(max_attempts=3, base_delay=0.5, exceptions=(asyncpg.PostgresError,))
     async def save_staging(
         self,
@@ -92,10 +66,6 @@ class StagingStore:
         structured_data: Optional[dict[str, Any]],
         ocr_confidence: float,
     ) -> None:
-        """
-        Save structured data to staging (pending state).
-        The record expires automatically after STAGING_TTL_HOURS.
-        """
         expires_at = datetime.now(timezone.utc) + timedelta(hours=STAGING_TTL_HOURS)
         pool = await get_pool()
         async with pool.acquire() as conn:
@@ -121,15 +91,9 @@ class StagingStore:
             )
         logger.info(f"Staging saved: document={document_id} user={user_id}")
 
-    # ── Read staging ──────────────────────────────────────────────
-
     async def get_staging(
         self, document_id: str, user_id: str
     ) -> Optional[dict[str, Any]]:
-        """
-        Retrieve a staging record.
-        Returns None if not found, expired, or wrong user_id.
-        """
         pool = await get_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -161,7 +125,6 @@ class StagingStore:
         }
 
     async def list_pending(self, user_id: str) -> list[dict[str, Any]]:
-        """List all pending staging records for a user."""
         pool = await get_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch(
@@ -178,14 +141,9 @@ class StagingStore:
             )
         return [dict(r) for r in rows]
 
-    # ── Confirm ───────────────────────────────────────────────────
 
     @async_retry(max_attempts=3, base_delay=0.5, exceptions=(asyncpg.PostgresError,))
     async def confirm(self, document_id: str, user_id: str) -> bool:
-        """
-        Move structured data from staging → lab_results (permanent).
-        Returns True if a record was found and confirmed, False otherwise.
-        """
         pool = await get_pool()
         async with pool.acquire() as conn:
             # Fetch the staging row (verify ownership)
@@ -209,7 +167,6 @@ class StagingStore:
                 return False
 
             async with conn.transaction():
-                # Insert into permanent table
                 await conn.execute(
                     """
                     INSERT INTO lab_results
@@ -224,7 +181,6 @@ class StagingStore:
                     row["filename"], row["document_type"],
                     row["structured_data"], row["ocr_confidence"],
                 )
-                # Mark staging as confirmed (don't delete — useful for audit)
                 await conn.execute(
                     """
                     UPDATE lab_result_staging
@@ -237,15 +193,8 @@ class StagingStore:
         logger.info(f"Confirmed: document={document_id} user={user_id}")
         return True
 
-    # ── Discard ───────────────────────────────────────────────────
-
     @async_retry(max_attempts=3, base_delay=0.5, exceptions=(asyncpg.PostgresError,))
     async def discard(self, document_id: str, user_id: str) -> bool:
-        """
-        Mark staging record as discarded.
-        The caller (router) is responsible for also removing RAG vectors.
-        Returns True if a record was found.
-        """
         pool = await get_pool()
         async with pool.acquire() as conn:
             result = await conn.execute(
@@ -267,13 +216,7 @@ class StagingStore:
             )
         return found
 
-    # ── Cleanup ───────────────────────────────────────────────────
-
     async def cleanup_expired(self) -> int:
-        """
-        Delete staging records past their TTL.
-        Call from a background task or cron — not on every request.
-        """
         pool = await get_pool()
         async with pool.acquire() as conn:
             result = await conn.execute(
@@ -284,10 +227,7 @@ class StagingStore:
             logger.info(f"Cleaned up {count} expired staging records.")
         return count
 
-    # ── Query confirmed results ────────────────────────────────────
-
     async def get_lab_results(self, user_id: str) -> list[dict[str, Any]]:
-        """Retrieve all confirmed lab results for dashboard."""
         pool = await get_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch(
