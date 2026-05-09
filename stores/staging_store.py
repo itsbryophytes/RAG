@@ -143,10 +143,9 @@ class StagingStore:
 
 
     @async_retry(max_attempts=3, base_delay=0.5, exceptions=(asyncpg.PostgresError,))
-    async def confirm(self, document_id: str, user_id: str) -> bool:
+    async def confirm(self, document_id: str, user_id: str, new_data: Optional[dict[str, Any]] = None) -> bool:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            # Fetch the staging row (verify ownership)
             row = await conn.fetchrow(
                 """
                 SELECT document_id, user_id, filename, document_type,
@@ -166,6 +165,8 @@ class StagingStore:
                 )
                 return False
 
+            final_structured = new_data if new_data is not None else json.loads(row["structured_data"])
+
             async with conn.transaction():
                 await conn.execute(
                     """
@@ -179,7 +180,7 @@ class StagingStore:
                     """,
                     row["document_id"], row["user_id"],
                     row["filename"], row["document_type"],
-                    row["structured_data"], row["ocr_confidence"],
+                    json.dumps(final_structured), row["ocr_confidence"],
                 )
                 await conn.execute(
                     """
@@ -247,3 +248,63 @@ class StagingStore:
             }
             for r in rows
         ]
+
+    @async_retry(max_attempts=3, base_delay=0.5, exceptions=(asyncpg.PostgresError,))
+    async def update_result(self, document_id: str, user_id: str, new_data: dict[str, Any]) -> bool:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE lab_results
+                SET structured_data = $3::JSONB
+                WHERE document_id = $1 AND user_id = $2;
+                """,
+                document_id, user_id, json.dumps(new_data)
+            )
+        found = int(result.split()[-1]) > 0
+        if found:
+            logger.info(f"Updated result: document={document_id} user={user_id}")
+        return found
+
+    @async_retry(max_attempts=3, base_delay=0.5, exceptions=(asyncpg.PostgresError,))
+    async def delete_result(self, document_id: str, user_id: str) -> bool:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM lab_results WHERE document_id = $1 AND user_id = $2;",
+                document_id, user_id
+            )
+        found = int(result.split()[-1]) > 0
+        if found:
+            logger.info(f"Deleted result: document={document_id} user={user_id}")
+        return found
+
+    @async_retry(max_attempts=3, base_delay=0.5, exceptions=(asyncpg.PostgresError,))
+    async def save_manual(
+        self,
+        document_id: str,
+        user_id: str,
+        filename: str,
+        document_type: DocumentType,
+        structured_data: dict[str, Any],
+    ) -> None:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO lab_results
+                    (document_id, user_id, filename, document_type,
+                     structured_data, ocr_confidence)
+                VALUES ($1, $2, $3, $4, $5::JSONB, $6)
+                ON CONFLICT (document_id) DO UPDATE SET
+                    structured_data = EXCLUDED.structured_data,
+                    confirmed_at    = NOW();
+                """,
+                document_id,
+                user_id,
+                filename,
+                document_type.value,
+                json.dumps(structured_data),
+                1.0,
+            )
+        logger.info(f"Manual record saved: document={document_id} user={user_id}")

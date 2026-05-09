@@ -95,3 +95,9 @@ class DiscardResponse(BaseModel):
     user_id: str
     rag_chunks_removed: int
     message: str
+
+class UpdateResultRequest(BaseModel):
+    report_date: Optional[str] = None
+    lab_name: Optional[str] = None
+    metrics: dict[str, Any]
+    user_id: Optional[str] = None
