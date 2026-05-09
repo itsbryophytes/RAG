@@ -1,25 +1,7 @@
-"""
-routers/pipeline_router.py — Document ingestion + confirmation endpoints.
-
-New endpoints:
-  POST   /api/pipeline/upload                 → ingest (OCR + RAG + staging)
-  GET    /api/pipeline/staging/{document_id}  → fetch staging preview
-  GET    /api/pipeline/staging                → list pending staging records
-  POST   /api/pipeline/confirm/{document_id}  → confirm → save to lab_results
-  POST   /api/pipeline/discard/{document_id}  → discard → optionally remove from RAG
-  GET    /api/pipeline/results                → list confirmed lab results (dashboard)
-  GET    /api/pipeline/documents              → list RAG-indexed documents
-  DELETE /api/pipeline/documents/{doc_id}     → delete from RAG
-
-Old /api/pipeline/upload is now backed by ingestion_pipeline.ingest()
-instead of document_pipeline.ingest_document().
-"""
-
-import json
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query, Request
 import uuid
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query, Body
 
-from models.schemas import IngestionResponse, ConfirmResponse, DiscardResponse
+from models.schemas import IngestionResponse, ConfirmResponse, DiscardResponse, UpdateResultRequest
 from models.enums import DocumentType
 from pipelines.ingestion_pipeline import ingest
 from services.rag_service import RAGService
@@ -30,12 +12,10 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/pipeline", tags=["pipeline"])
 
-_staging  = StagingStore()
-_rag_svc  = RAGService()
+_staging = StagingStore()
+_rag_svc = RAGService()
 _vector_store = PGVectorStore()
 
-
-# ── Upload ────────────────────────────────────────────────────────────────────
 
 @router.post("/upload", response_model=IngestionResponse)
 async def upload_document(
@@ -43,42 +23,50 @@ async def upload_document(
     document_type: DocumentType = Form(default=DocumentType.LAB_RESULT),
     file: UploadFile = File(...),
 ):
-    """
-    Upload a lab result image or PDF.
-
-    Immediately:
-      - Runs OCR and parameter extraction
-      - Indexes text into vector DB (RAG is ready for chat)
-      - Saves structured data to staging for preview
-
-    Returns a preview of extracted parameters.
-    The user must call /confirm or /discard to finalise.
-
-    Supported: JPEG, PNG, TIFF, BMP, WebP, PDF (max 20 MB)
-    """
     logger.info(f"Upload: user={user_id} file={file.filename}")
     return await ingest(user_id=user_id, file=file, document_type=document_type)
 
 
-# ── Staging preview ───────────────────────────────────────────────────────────
+@router.post("/manual")
+async def create_manual_record(
+    request: Request,
+    body: UpdateResultRequest,
+    user_id: str = Query(default=None, min_length=1, max_length=128),
+):
+    final_user_id = user_id or body.user_id
+    if not final_user_id:
+        raise HTTPException(status_code=422, detail="user_id is required in query or body")
+
+    logger.info(f"Manual record request: URL={request.url} user_id={final_user_id}")
+    document_id = str(uuid.uuid4())
+
+    new_data = {
+        "report_date": body.report_date,
+        "lab_name": body.lab_name,
+        "metrics": body.metrics
+    }
+
+    await _staging.save_manual(
+        document_id=document_id,
+        user_id=final_user_id,
+        filename=body.lab_name or "Manual Entry",
+        document_type=DocumentType.LAB_RESULT,
+        structured_data=new_data
+    )
+
+    return {"message": "Manual record saved.", "document_id": document_id}
+
 
 @router.get("/staging/{document_id}")
 async def get_staging_preview(
     document_id: str,
     user_id: str = Query(..., min_length=1, max_length=128),
 ):
-    """
-    Retrieve the staging preview for a specific document.
-    Used by the frontend to re-fetch the preview if needed.
-    """
     record = await _staging.get_staging(document_id, user_id)
     if not record:
         raise HTTPException(
             status_code=404,
-            detail=(
-                f"Staging record not found for document_id={document_id}. "
-                "It may have expired (TTL 24h) or already been confirmed/discarded."
-            ),
+            detail=f"Staging record not found for document_id={document_id}.",
         )
     return record
 
@@ -87,37 +75,28 @@ async def get_staging_preview(
 async def list_staging(
     user_id: str = Query(..., min_length=1, max_length=128),
 ):
-    """List all pending staging records (uploads awaiting confirmation)."""
     records = await _staging.list_pending(user_id)
     return {"user_id": user_id, "pending": records, "count": len(records)}
 
-
-# ── Confirm ───────────────────────────────────────────────────────────────────
 
 @router.post("/confirm/{document_id}", response_model=ConfirmResponse)
 async def confirm_document(
     document_id: str,
     user_id: str = Query(..., min_length=1, max_length=128),
-    updated_data: dict | None = Body(default=None),
+    body: UpdateResultRequest | None = None,
 ):
-    """
-    Confirm a document preview → saves structured data to the permanent
-    lab_results table. RAG vectors are already in place from upload.
+    new_data = None
+    if body:
+        new_data = {
+            "report_date": body.report_date,
+            "lab_name": body.lab_name,
+            "metrics": body.metrics
+        }
 
-    If updated_data is provided (JSON body), it replaces the original OCR extraction.
-    The body should be: { "report_date": "...", "lab_name": "...", "metrics": {...} }
-    """
-    saved = await _staging.confirm(
-        document_id=document_id, user_id=user_id, updated_data=updated_data
-    )
+    saved = await _staging.confirm(document_id=document_id, user_id=user_id, new_data=new_data)
     if not saved:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"No pending staging record found for document_id={document_id}. "
-                "It may have expired (24h TTL), already been confirmed, or discarded."
-            ),
-        )
+        raise HTTPException(status_code=404, detail="Staging record not found.")
+
     return ConfirmResponse(
         document_id=document_id,
         user_id=user_id,
@@ -126,31 +105,15 @@ async def confirm_document(
     )
 
 
-# ── Discard ───────────────────────────────────────────────────────────────────
-
 @router.post("/discard/{document_id}", response_model=DiscardResponse)
 async def discard_document(
     document_id: str,
     user_id: str = Query(..., min_length=1, max_length=128),
-    remove_from_rag: bool = Query(
-        default=True,
-        description="If true, also removes the document's vectors from the chat index.",
-    ),
+    remove_from_rag: bool = Query(default=True),
 ):
-    """
-    Discard a document preview.
-    Structured data is marked as discarded and never saved to lab_results.
-
-    remove_from_rag (default: true):
-      Set to false if you want the user to still chat about the document
-      even after discarding it from their health record.
-    """
     discarded = await _staging.discard(document_id=document_id, user_id=user_id)
     if not discarded:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No pending staging record found for document_id={document_id}.",
-        )
+        raise HTTPException(status_code=404, detail="Staging record not found.")
 
     rag_chunks_removed = 0
     if remove_from_rag:
@@ -163,133 +126,55 @@ async def discard_document(
         document_id=document_id,
         user_id=user_id,
         rag_chunks_removed=rag_chunks_removed,
-        message=(
-            "Document discarded. "
-            + (
-                f"{rag_chunks_removed} RAG chunks removed."
-                if remove_from_rag
-                else "RAG vectors kept (remove_from_rag=false)."
-            )
-        ),
+        message="Document discarded."
     )
 
-
-@router.post("/manual")
-async def create_manual_record(body: dict):
-    """
-    Create a manual health record.
-    Saves to lab_results and indexes for RAG.
-    """
-    user_id = body.get("user_id")
-    if not user_id:
-        raise HTTPException(status_code=400, detail="user_id is required")
-
-    document_id = str(uuid.uuid4())
-    lab_name = body.get("lab_name", "Manual Entry")
-    report_date = body.get("report_date", "")
-    metrics = body.get("metrics", {})
-
-    # Use the same structured_data shape as confirmed OCR documents so the
-    # frontend mapping is identical on every re-fetch:
-    # { report_date, lab_name, metrics: { ... } }
-    structured_data = {
-        "report_date": report_date,
-        "lab_name": lab_name,
-        "metrics": metrics,
-    }
-
-    # 1. Index for RAG
-    summary = f"Manual Lab Result from {lab_name} on {report_date}.\n"
-    for k, v in metrics.items():
-        if v: summary += f"{k}: {v}\n"
-
-    await _rag_svc.index_text(
-        user_id=user_id,
-        document_id=document_id,
-        text=summary,
-        extra_metadata={
-            "source": "manual",
-            "lab_name": lab_name,
-            "report_date": report_date,
-        }
-    )
-
-    # 2. Save to lab_results
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO lab_results
-                (document_id, user_id, filename, document_type,
-                 structured_data, ocr_confidence)
-            VALUES ($1, $2, $3, 'lab_result', $4::JSONB, 1.0);
-            """,
-            document_id, user_id, f"Manual_{report_date}",
-            json.dumps(structured_data)
-        )
-
-    return {"document_id": document_id, "message": "Manual record created."}
-
-
-# ── Dashboard: confirmed results ──────────────────────────────────────────────
 
 @router.get("/results")
-async def get_lab_results(
-    user_id: str = Query(..., min_length=1, max_length=128),
-):
-    """
-    Return all confirmed lab results for the user's dashboard.
-    Only records that the user explicitly confirmed are included.
-    """
+async def get_lab_results(user_id: str = Query(...)):
     results = await _staging.get_lab_results(user_id)
     return {"user_id": user_id, "results": results, "count": len(results)}
 
 
-@router.put("/results/{document_id}")
-async def update_lab_result(
-    document_id: str,
-    user_id: str = Query(..., min_length=1, max_length=128),
-    updated_data: dict = Body(...),
-):
-    """Update an existing confirmed lab result."""
-    updated = await _staging.update_lab_result(
-        document_id=document_id, user_id=user_id, updated_data=updated_data
-    )
-    if not updated:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Lab result not found for document_id={document_id}.",
-        )
-    return {"message": "Lab result updated successfully.", "document_id": document_id}
-
-
-# ── RAG document management ───────────────────────────────────────────────────
-
 @router.get("/documents")
-async def list_documents(
-    user_id: str = Query(..., min_length=1, max_length=128),
-):
-    """List all documents currently indexed in the vector store for this user."""
+async def list_documents(user_id: str = Query(...)):
     docs = await _vector_store.list_documents(user_id)
     return {"user_id": user_id, "documents": docs, "count": len(docs)}
 
 
-@router.delete("/documents/{document_id}")
-async def delete_document(
+@router.put("/results/{document_id}")
+async def update_result(
     document_id: str,
-    user_id: str = Query(..., min_length=1, max_length=128),
+    body: UpdateResultRequest,
+    user_id: str = Query(...),
 ):
-    """Remove a document's vectors from the RAG index."""
-    deleted = await _rag_svc.delete_document(user_id, document_id)
-    if deleted == 0:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Document {document_id} not found in RAG index for user {user_id}.",
-        )
-    return {"message": f"Deleted {deleted} chunks.", "document_id": document_id}
+    new_data = {
+        "report_date": body.report_date,
+        "lab_name": body.lab_name,
+        "metrics": body.metrics
+    }
+
+    updated = await _staging.update_result(document_id, user_id, new_data)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Result not found.")
+
+    return {"message": "Result updated.", "document_id": document_id}
 
 
-# ── Health ────────────────────────────────────────────────────────────────────
+@router.delete("/documents/{document_id}")
+async def delete_document(document_id: str, user_id: str = Query(...)):
+    chunks_deleted = await _rag_svc.delete_document(user_id, document_id)
+    db_deleted = await _staging.delete_result(document_id, user_id)
+
+    if chunks_deleted == 0 and not db_deleted:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    return {
+        "message": "Document deleted.",
+        "document_id": document_id,
+        "database_deleted": db_deleted
+    }
+
 
 @router.get("/health")
 async def health():

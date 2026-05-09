@@ -140,6 +140,45 @@ async def ingest(
 def _serialize_structured(structured) -> dict | None:
     if not structured:
         return None
+    
+    metrics_map = {
+        "glucose fasting": "glucose_fasting",
+        "glucose postmeal": "glucose_postmeal",
+        "hba1c": "hba1c",
+        "total cholesterol": "chol_total",
+        "ldl": "chol_ldl",
+        "hdl": "chol_hdl",
+        "triglyceride": "triglycerides",
+        "hemoglobin": "hemoglobin",
+        "hematocrit": "hematocrit",
+        "wbc": "wbc",
+        "leukosit": "wbc",
+        "platelet": "platelets",
+        "trombosit": "platelets",
+        "uric acid": "uric_acid",
+        "asam urat": "uric_acid",
+        "creatinine": "creatinine",
+        "kreatinin": "creatinine",
+        "bun": "bun",
+        "blood urea nitrogen": "bun",
+    }
+
+    metrics = {}
+    additional_metrics = {}
+    
+    for p in structured.parameters:
+        lower_name = p.name.lower()
+        found = False
+        for key, target in metrics_map.items():
+            if key in lower_name:
+                metrics[target] = p.value
+                found = True
+                break
+        if not found:
+            additional_metrics[p.name] = p.value
+
+    metrics["additional_metrics"] = additional_metrics
+
     return {
         "parameters": {
             p.name: {
@@ -151,8 +190,10 @@ def _serialize_structured(structured) -> dict | None:
             }
             for p in structured.parameters
         },
+        "metrics":      metrics,
         "lab_name":     structured.lab_name,
         "patient_name": structured.patient_name,
+        "report_date":  structured.date,
         "date":         structured.date,
         "confidence":   structured.confidence,
         "warnings":     structured.warnings,
