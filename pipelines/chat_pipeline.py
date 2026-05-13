@@ -78,9 +78,6 @@ async def chat_stream(request: ChatRequest) -> AsyncIterator[str]:
         yield "data: [DONE]\n\n"
         return
 
-    # ── 1. Condense Question (Context Awareness) ───────────
-    # If there is history, we ask Gemini to create a standalone query
-    # that incorporates the previous context for better RAG retrieval.
     search_query = message
     if request.history:
         history_summary = "\n".join([f"{m.role}: {m.content}" for m in request.history])
@@ -102,7 +99,6 @@ Standalone Question (return ONLY the question):"""
         except Exception as exc:
             logger.warning(f"Condense question failed: {exc}")
 
-    # ── 2. Retrieval ──────────────────────────────────────
     query_embedding = None
     try:
         query_embedding = await _embedding_svc.embed_query(search_query)
@@ -114,7 +110,6 @@ Standalone Question (return ONLY the question):"""
 
     if query_embedding is not None:
         try:
-            # Lowering default threshold to 0.5 for better recall
             effective_threshold = request.threshold if request.threshold == 0.65 else request.threshold
             if effective_threshold == 0.65: effective_threshold = 0.5 
             
@@ -140,15 +135,12 @@ Standalone Question (return ONLY the question):"""
     else:
         context_block = "No specific medical records found for this query."
 
-    # ── 3. Generation ─────────────────────────────────────
-    # Fetch user profile for more context
     profile_block = ""
     try:
         profile = await _vector_store.get_user_profile(user_id)
         if profile:
             items = []
             if profile.get("date_of_birth"):
-                # Simple age calculation if possible
                 dob = profile["date_of_birth"]
                 items.append(f"DOB: {dob}")
             if profile.get("biological_sex"): items.append(f"Sex: {profile['biological_sex']}")
